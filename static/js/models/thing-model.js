@@ -11,6 +11,8 @@ const API = require('../api');
 const App = require('../app');
 const Model = require('./model');
 const Constants = require('../constants');
+const Semaphore = require('./semaphore');
+const CV = require('./cv');
 
 class ThingModel extends Model {
   constructor(description, ws) {
@@ -19,6 +21,11 @@ class ThingModel extends Model {
     this.properties = {};
     this.events = [];
     this.connected = false;
+    this.sequenceNumber = 0;
+    this.semaphore = new Semaphore(1);
+    this.cv = new CV();
+    this.sessionId = Math.random();
+    this.sequenceNumberUsed = false;
 
     // Parse base URL of Thing
     if (description.href) {
@@ -164,7 +171,14 @@ class ThingModel extends Model {
    * @param {*} value - value of the property
    * @return {Promise} which resolves to the property set.
    */
-  setProperty(name, value) {
+  async setProperty(name, value) {
+    if (this.sequenceNumberUsed) {
+      return;
+    }
+
+    await this.semaphore.acquire({blocking: true, timeout: 10000});
+    this.sequenceNumberUsed = true;
+
     if (!this.propertyDescriptions.hasOwnProperty(name)) {
       return Promise.reject(`Unavailable property name ${name}`);
     }
@@ -182,9 +196,6 @@ class ThingModel extends Model {
     }
 
     const property = this.propertyDescriptions[name];
-    const payload = {
-      [name]: value,
-    };
 
     let href;
     for (const link of property.links) {
@@ -194,12 +205,73 @@ class ThingModel extends Model {
       }
     }
 
-    return API.putJson(href, payload).then((json) => {
+    // Protocol step 0: Acquire lock from gateway
+    const acquire_gateway_lock_payload = {
+      ['sequenceNumber'] : this.sequenceNumber,
+      ['sessionId'] : this.sessionId,
+      ['protocolStep'] : 0
+    }
+    
+    API.putJson(href, acquire_gateway_lock_payload).then((json) => {
+      //TODO:DELETE
+      console.log('prot0'+json['returnSequenceNumber']);
+
+      if (json['returnSequenceNumber'] != this.sequenceNumber) {
+        console.error('Error in sequence number. Expected: ' + this.sequenceNumber + '\nRecieved: ' + json['returnSequenceNumber']);
+      }
+      this.cv.signal();
+    }).catch((error) => {
+      console.error(error);
+      throw new Error(`Error trying to acquire gateway lock ${name}`);
+    });
+    await this.cv.wait(this.semaphore, {blocking: true, timeout: 10000});
+
+    // Protocol step 1: Execute
+    const payload = {
+      [name]: value,
+      ['sequenceNumber'] : this.sequenceNumber,
+      ['sessionId'] : this.sessionId,
+      ['protocolStep'] : 1
+    };
+
+    const res = API.putJson(href, payload).then((json) => {
       this.onPropertyStatus(json);
+      if (json['returnSequenceNumber'] != this.sequenceNumber) {
+        console.error('Error in sequence number. Expected: ' + this.sequenceNumber + '\nRecieved: ' + json['returnSequenceNumber']);
+      }
+      this.cv.signal();
     }).catch((error) => {
       console.error(error);
       throw new Error(`Error trying to set ${name}`);
     });
+    await this.cv.wait(this.semaphore, {blocking: true, timeout: 10000});
+
+    // Protocol step 2: Release Lock
+    const release_gateway_lock_payload = {
+      ['sequenceNumber'] : this.sequenceNumber,
+      ['sessionId'] : this.sessionId,
+      ['protocolStep'] : 2
+    }
+    
+    API.putJson(href, release_gateway_lock_payload).then((json) => {
+      //TODO:DELETE
+      console.log('prot2'+json['returnSequenceNumber']);
+      
+      if (json['returnSequenceNumber'] != this.sequenceNumber) {
+        console.error('Error in sequence number. Expected: ' + this.sequenceNumber + '\nRecieved: ' + json['returnSequenceNumber']);
+      }
+      this.cv.signal();
+    }).catch((error) => {
+      console.error(error);
+      throw new Error(`Error trying to release gateway lock ${name}`);
+    });
+    await this.cv.wait(this.semaphore, {blocking: true, timeout: 10000});
+
+    this.sequenceNumber = this.sequenceNumber + 1;
+    this.sequenceNumberUsed = false;
+
+    this.semaphore.release();
+    return res;
   }
 
   /**

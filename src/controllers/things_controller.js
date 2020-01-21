@@ -20,8 +20,14 @@ const PromiseRouter = require('express-promise-router');
 const Settings = require('../models/settings');
 const Things = require('../models/things');
 const WebSocket = require('ws');
+const Semaphore = require('./semaphore');
+const CV = require('./cv');
 
 const ThingsController = PromiseRouter();
+
+var semaphoreDict = {};
+var cvDict = {};
+var sequenceNumberDict = {};
 
 /**
  * Connect to receive messages from a Thing or all Things
@@ -253,20 +259,75 @@ ThingsController.get(
 ThingsController.put(
   '/:thingId/properties/:propertyName',
   async (request, response) => {
+    // Protocol step 0: Acquire gateway lock
+    if (request.body['protocolStep'] == 0){
+      const thingPropertyId = request.params.thingId + request.params.propertyName;
+      if (semaphoreDict[thingPropertyId] == null) {
+        semaphoreDict[thingPropertyId] = new Semaphore(1);
+      }
+
+      const sequenceIndex = request.body['sessionId'] + thingPropertyId;
+      if (sequenceNumberDict[sequenceIndex] == null) {
+        sequenceNumberDict[sequenceIndex] = 0;
+      }
+      if (cvDict[sequenceIndex] == null) {
+        cvDict[sequenceIndex] = new CV();
+      }
+
+      let sequenceNumber = request.body['sequenceNumber'];
+      if (sequenceNumberDict[sequenceIndex] > sequenceNumber) {
+        console.error('Incorrect sequence number: Expected ' + sequenceNumberDict[sequenceIndex] + '\nRecieved: ' + sequenceNumber);
+      }
+      else while (sequenceNumberDict[sequenceIndex] < sequenceNumber) {
+        await cvDict[sequenceIndex].wait(semaphoreDict[thingPropertyId], {blocking: true, timeout: 10000});
+      }
+
+      await semaphoreDict[thingPropertyId].acquire({blocking: true, timeout: 10000});
+
+      const result = {
+        ['returnSequenceNumber']: sequenceNumber,
+      };
+
+      response.status(200).json(result);
+      return;
+    }
+
+    // Protocol step 2: Release Gateway Lock
+    if (request.body['protocolStep'] == 2){
+      let sequenceNumber = request.body['sequenceNumber'];
+      const result = {
+        ['returnSequenceNumber']: sequenceNumber,
+      };
+
+      const thingPropertyId = request.params.thingId + request.params.propertyName;
+      const sequenceIndex = request.body['sessionId'] + thingPropertyId;
+      sequenceNumberDict[sequenceIndex]++;
+      semaphoreDict[thingPropertyId].release();
+      cvDict[sequenceIndex].broadcast();
+      response.status(200).json(result);
+      return;
+    }
+    
+    // Protocol step 1: Execute
     const thingId = request.params.thingId;
     const propertyName = request.params.propertyName;
+    
+    let sequenceNumber = request.body['sequenceNumber'];
+
     if (!request.body || typeof request.body[propertyName] === 'undefined') {
       response.status(400).send('Invalid property name');
       return;
     }
     const value = request.body[propertyName];
     try {
+
       const updatedValue = await Things.setThingProperty(thingId, propertyName,
-                                                         value);
-      const result = {
-        [propertyName]: updatedValue,
-      };
-      response.status(200).json(result);
+        value);
+        const result = {
+          [propertyName]: updatedValue,
+          ['returnSequenceNumber']: sequenceNumber,
+        };
+        response.status(200).json(result);
     } catch (e) {
       response.status(e.code).send(e.message);
     }
