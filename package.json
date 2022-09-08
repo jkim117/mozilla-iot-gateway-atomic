@@ -104,7 +104,7 @@
     "jest": "^24.9.0",
     "jsdom": "^15.2.1",
     "jsonfile": "^5.0.0",
-    "jszip": "^3.2.2",
+    "jszip": "^3.7.0",
     "mini-css-extract-plugin": "^0.8.0",
     "mobile-drag-drop": "^2.3.0-rc.2",
     "nock": "^11.7.0",
